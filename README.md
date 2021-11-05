@@ -14,8 +14,8 @@ edited the files, you have to re-pack everything into a new
 firmware file, updating CRC32 and MD5 checksums.
 
 The scripts are tested on firmwares for the **SJCAM SJ8 Pro** 
-and the **Firefly X Lite** cameras, they can extract each 
-section from the archive, and check the CRC32 checksums.
+and the Hawk Eye **Firefly X Lite** cameras, they can extract 
+each section from the archive, and check the CRC32 checksums.
 
 Generally the firmware sections may consist of RTOS (Real Time 
 Operating System) images, Linux kernel images, GNU/Linux root 
@@ -31,7 +31,7 @@ script.
 As far I know, there is no official documentation about 
 firmwares file format and it is no clear if the file format is 
 common to all the Ambarella H22 cameras or if each maker (SJCAM, 
-Firefly, etc.) can customize it freely.
+Hawk Eye, etc.) can customize it freely.
 
 The scripts are based on reverese engeneering and upon some 
 softwares available as open source:
@@ -73,3 +73,10 @@ The **SRC_DIRECTORY** must contains files as they were extracted
 (headers, binary images, files lists and subdirectories), the 
 **DST_FIRMWARE.bin** and **DST_FIRMWARE.ch** will be created 
 with updated CRC32 and MD5 checksums.
+
+## Firmwares used for testing
+
+* [SJ8 Series Firmware](http://support.sjcam.com/support/solutions/folders/9000184902)
+* [Firefly Firmwares](http://www.hawkeyefpv.com.cn/About.aspx?ClassID=35)
+* [SJ10 Series Firmware Updates](http://support.sjcam.com/support/solutions/folders/9000192806)
+
