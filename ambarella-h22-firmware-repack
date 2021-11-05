@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Re-pack files extracted from an Ambarella H22 firmware file using
+the ambarella-h22-firmware-unpack tool.
+Section lengths, CRC32 and MD5 checksum are re-calculated and
+headers are updated.
+"""
+
+import hashlib
+import mmap
+import os.path
+import sys
+import zlib
+
+__author__ = "Niccolo Rigacci"
+__copyright__ = "Copyright 2021 Niccolo Rigacci <niccolo@rigacci.org>"
+__license__ = "GPLv3-or-later"
+__email__ = "niccolo@rigacci.org"
+__version__ = "0.1.0"
+
+ROMFS_TYPE = 'SJ8PRO'
+#ROMFS_TYPE = 'SJ10PRO'
+
+# File header, containing the firmware sections table.
+FIRMWARE_FILE_HEADER_LEN = 560
+FIRMWARE_FILE_HEADER_SECTIONS_TABLE_OFFSET = 48
+# Ambarella firmare sections.
+SECTION_HEADER_LEN = 256
+# Ambarella ROMFS partition header Magic identifier: 0x8A32FC66.
+ROMFS_PARTITION_HEADER_MAGIC = b'\x8A\x32\xFC\x66'
+if ROMFS_TYPE == 'SJ8PRO':
+    # SJ8Pro, Firefly X Lite
+    ROMFS_PARTITION_HEADER_LEN = 2048 * 3
+    ROMFS_FILENAME_LEN = 64
+else:
+    # SJ10Pro
+    ROMFS_PARTITION_HEADER_LEN = 2048 * 68
+    ROMFS_FILENAME_LEN = 256
+ROMFS_FILE_ENTRY_LEN = ROMFS_FILENAME_LEN + 12
+
+def update_sections_table(firmware, sections_count, section_len, crc32_running):
+    """ Update section length and running CRC32 in header's sections table """
+    firmware.seek(FIRMWARE_FILE_HEADER_SECTIONS_TABLE_OFFSET + 8 * sections_count)
+    firmware.write(section_len.to_bytes(4, 'little'))
+    crc32_negated = 0xffffffff ^ crc32_running
+    firmware.write(crc32_negated.to_bytes(4, 'little'))
+    firmware.seek(0, 2)
+
+
+def get_content(filename):
+    """ Read a whole file in binary mode and return it as a bytes object """
+    with open(filename, 'rb') as f:
+        return f.read()
+
+
+def replace_bytes(buffer, offset, replace):
+    """ Replace some bytes at specified offset in buffer of bytes """
+    return buffer[0:offset] + replace + buffer[offset+len(replace):]
+
+
+#-------------------------------------------------------------------------
+# Get filenames from command line.
+#-------------------------------------------------------------------------
+if len(sys.argv) < 4:
+    print('Usage: %s SRC_DIRECTORY DST_FIRMWARE.bin DST_FIRMWARE.ch' % (os.path.basename(sys.argv[0]),))
+    sys.exit(1)
+
+src_directory = sys.argv[1]
+dst_firmware = sys.argv[2]
+dst_checksum = sys.argv[3]
+
+if os.path.exists(dst_firmware):
+    print('ERROR: File "%s" alrady exists' % (dst_firmware,))
+    sys.exit(1)
+if os.path.exists(dst_checksum):
+    print('ERROR: File "%s" alrady exists' % (dst_checksum,))
+    sys.exit(1)
+
+firmware = open(dst_firmware, 'wb')
+firmware.close()
+firmware = open(dst_firmware, 'r+b')
+
+# Read items contained into the source directory.
+items = os.listdir(src_directory)
+items.sort()
+
+sections_count = 0
+crc32_running = 0
+for i in items:
+    if i == '00000000_header.bin':
+        print('Processing file header 0x00000000')
+        firmware.write(get_content(os.path.join(src_directory, i)))
+    elif i.endswith('_head.bin'):
+        # Process each section header.
+        offset_head = int(i[0:-9], 16)
+        offset_sect = offset_head + SECTION_HEADER_LEN
+        print('Processing section header 0x%08x' % (offset_head,))
+        section_filename = os.path.join(src_directory, '%08X_sect.bin' % (offset_sect,))
+        section_romfs_list = os.path.join(src_directory, '%08X.dir' % (offset_sect,))
+        section_romfs_dir = os.path.join(src_directory, '%08X_files' % (offset_sect,))
+        if os.path.isfile(section_romfs_list):
+            # Section is a ROMFS partition: re-pack each file.
+            file_offset = ROMFS_PARTITION_HEADER_LEN
+            file_list = []
+            with open(section_romfs_list, 'r') as f:
+                file_list = f.read().splitlines()
+            subdir = os.path.join(src_directory, '%08X_files' % (offset_sect,))
+            romfs_header = b''
+            romfs_image = b''
+            romfs_header += ROMFS_PARTITION_HEADER_MAGIC
+            romfs_header += len(file_list).to_bytes(4, 'little')
+            for f in file_list:
+                filename = os.path.join(section_romfs_dir, f)
+                print('  Adding file %s' % (filename,))
+                file_content = get_content(filename)
+                file_len = len(file_content)
+                file_crc32 = zlib.crc32(file_content, 0) & 0xffffffff
+                padding_zeroes = 2048 - (file_len % 2048)
+                romfs_image += file_content
+                romfs_image += b'\0'*padding_zeroes
+                romfs_header += (f.encode('utf-8') + b'\0'*ROMFS_FILENAME_LEN)[0:ROMFS_FILENAME_LEN]
+                romfs_header += file_len.to_bytes(4, 'little')
+                romfs_header += file_offset.to_bytes(4, 'little')
+                romfs_header += file_crc32.to_bytes(4, 'little')
+                file_offset += (file_len + padding_zeroes)
+            padding_zeroes = ROMFS_PARTITION_HEADER_LEN - len(romfs_header)
+            romfs_header += b'\0'*padding_zeroes
+            # Get the original section header and update CRC32 and length.
+            section_header = get_content(os.path.join(src_directory, i))
+            section_data = romfs_header + romfs_image
+            section_len = len(section_data)
+            section_crc32 = zlib.crc32(section_data, 0) & 0xffffffff
+            section_header = replace_bytes(section_header, 0, section_crc32.to_bytes(4, 'little'))
+            section_header = replace_bytes(section_header, 12, section_len.to_bytes(4, 'little'))
+            section_complete = section_header + section_data
+            firmware.write(section_complete)
+            # Update section length and CRC32 in sections table.
+            crc32_running = zlib.crc32(section_complete, crc32_running) & 0xffffffff
+            update_sections_table(firmware, sections_count, len(section_complete), crc32_running)
+            sections_count += 1
+        elif os.path.isfile(section_filename):
+            # Section is a generic binary image: add header and section untouched.
+            print('  Adding data from section "%s"' % (section_filename,))
+            section_len = 0
+            content = get_content(os.path.join(src_directory, i))
+            section_len += len(content)
+            crc32_running = zlib.crc32(content, crc32_running) & 0xffffffff
+            firmware.write(content)
+            content = get_content(section_filename)
+            section_len += len(content)
+            firmware.write(content)
+            # Update section length and CRC32 in sections table.
+            crc32_running = zlib.crc32(content, crc32_running) & 0xffffffff
+            update_sections_table(firmware, sections_count, section_len, crc32_running)
+            sections_count += 1
+        else:
+            print('ERROR: Missing data for "%s": need either "%s" or "%s"' % (i, section_romfs_list, section_filename))
+            sys.exit(1)
+
+# Re-calculate the CRC32 excluding the firmware header.
+firmware.seek(FIRMWARE_FILE_HEADER_LEN)
+content = firmware.read()
+crc32 = zlib.crc32(content, 0) & 0xffffffff
+firmware.seek(36)
+firmware.write(crc32.to_bytes(4, 'little'))
+# Calculate the MD5 sum of the entire file.
+firmware.seek(0)
+md5 = hashlib.md5(firmware.read()).hexdigest()
+firmware.close()
+# Write the MD5 sum file as 4 * 32bits little endian integers.
+with open(dst_checksum, 'wb') as f:
+    for i in range(0, 4):
+        chunk = int(md5[i*8:(i+1)*8], 16)
+        f.write(chunk.to_bytes(4, 'little'))

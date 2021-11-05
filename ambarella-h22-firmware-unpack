@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Ambarella Firmware Analyzer and unpacker, based on reverse
+engeneering of SJCAM 8 Pro firmwares.
+
+Tested on firmwares for the SJCAM 8 Pro and the Hawkeye
+Firefly X, both based on the Ambarella H22 SoC.
+
+Thanks to the following open source projects:
+  * https://github.com/vmax1145/BitrateEditor
+  * https://github.com/o-gs/dji-firmware-tools
+"""
+
+import hashlib
+import mmap
+import os.path
+import sys
+import zlib
+
+__author__ = "Niccolo Rigacci"
+__copyright__ = "Copyright 2021 Niccolo Rigacci <niccolo@rigacci.org>"
+__license__ = "GPLv3-or-later"
+__email__ = "niccolo@rigacci.org"
+__version__ = "0.1.0"
+
+ROMFS_TYPE = 'SJ8PRO'
+#ROMFS_TYPE = 'SJ10PRO'
+
+# File header, containing the firmware sections table.
+FIRMWARE_FILE_HEADER_LEN = 560
+FIRMWARE_FILE_HEADER_NAME_LEN = 32
+FIRMWARE_FILE_HEADER_SECTIONS_TABLE_OFFSET = 48
+FIRMWARE_FILE_HEADER_SECTIONS_TABLE_MAX_ENTRIES = 16
+# Ambarella firmware section Magic identifier: 0x90EB24A3.
+SECTION_MAGIC = b'\x90\xEB\x24\xA3'
+SECTION_HEADER_LEN = 256
+SECTION_VERSION_FORMAT = 'big'  # Minor and major number byte order: 'little' or 'big'.
+# Ambarella ROMFS partition header Magic identifier: 0x8A32FC66.
+ROMFS_PARTITION_HEADER_MAGIC = b'\x8A\x32\xFC\x66'
+if ROMFS_TYPE == 'SJ8PRO':
+    # SJ8Pro, Firefly X Lite
+    ROMFS_PARTITION_HEADER_LEN = 2048 * 3
+    ROMFS_FILENAME_LEN = 64
+else:
+    # SJ10Pro
+    ROMFS_PARTITION_HEADER_LEN = 2048 * 68
+    ROMFS_FILENAME_LEN = 256
+ROMFS_FILE_ENTRY_LEN = ROMFS_FILENAME_LEN + 12
+
+
+# Structure of an SJ8 Pro (Ambarella H22) firmware file:
+#   * 560 bytes header
+#     * 32 bytes zeroes
+#     * 4 bytes: E6 DF 32 87 (Magic number? The same for SJ8Pro, SJ10Pro, Firefly X Lite)
+#     * 4 bytes: CRC32 of all the file content, from 0x00000230 to EOF
+#     * 8 bytes: zeroes
+#     * 16 * 8 bytes. One entry for each section:
+#       * 4 bytes: Length of section, from header to header, little endian.
+#       * 4 bytes: Running CRC32 of sections with negated bits, from header to header, little endian.
+#       * ...
+#     * At offset 0x00B0: 384 bytes ???
+#   * Firmware Sections (partitions images).
+
+# Structure of an Ambarella firmware section:
+#   * 256 bytes header
+#     * 4 bytes: CRC32 for the partition, excluding the header.
+#     * 2 + 2 bytes: Version minor and major number (big or little endian).
+#     * 1 + 1 + 2 bytes: day, month and year (little endian).
+#     * 4 bytes: Partition length, excluding the header, unsigned int little endian.
+#     * 4 bytes: Memory ???
+#     * 4 bytes: Flags ???
+#     * 4 bytes: Section Magic number '90EB24A3'.
+#     * 228 bytes: zeroes
+#   * Firmware section (partition image).
+
+# Structure of an Ambarella ROMFS partition (SJ8 Pro, Ambarella H22):
+#   * 4 bytes: Partition Magic number '8A32FC66'.
+#   * 4 bytes: File count, unsigned int little endian.
+#     * One entry for each file. Max 80 entries? (6144 - 4 - 4) / 76 = 80.736
+#       * 64 bytes: filename, zero terminated string (SJ8Pro, 256 bytes for the SJ10Pro)
+#       *  4 bytes: file length, unsigned int little endian.
+#       *  4 bytes: file offset relative to partition begin, unsigned int little endian.
+#       *  4 bytes: file CRC32, unsigned int little endian.
+#     * Zeroes padding to 6144 bytes (2048 * 3) from partition begin (2048 * 68 for the SJ10Pro)
+#     * For each file:
+#       * File content
+#       * Zeroes padding: (2048 - (file_end_offset % 2048))
+
+# Structure of an Ambarella ROMFS partition (SJ7 Star, Ambarella A12):
+#   * 4 bytes: File count, unsigned int little endian.
+#   * 4 bytes: Partition Magic number '8A32FC66'.
+#     * One entry of 128 bytes for each file.
+#       * 116 bytes: filename, zero terminated string.
+#       *   4 bytes: file offset relative to partition begin, unsigned int little endian.
+#       *   4 bytes: file length, unsigned int little endian.
+#       *   4 bytes: File entry Magic number '76AB8723'.
+#     * 0xFF padding to 2048 multiple from partition begin.
+#     * For each file:
+#       * File content
+#       * Padding ???
+
+
+def check_md5(file_bin, filename_sum):
+    """ Compare the MD5 sum of a memory mapped file with the content of a file """
+    file_bin.seek(0)
+    md5_calc = hashlib.md5(file_bin.read()).hexdigest()
+    # The file packs the MD5 sum as 4 * 32bits little endian integers.
+    with open(filename_sum, 'rb') as f:
+        md5_expected = ''
+        for i in range(0, 4):
+           int32 = int.from_bytes(f.read(4), 'little')
+           md5_expected += '%08x' % (int32,)
+    return (md5_calc.lower() == md5_expected.lower())
+
+
+def hex_repr(bytes):
+    """ Return the hex representation of bytes """
+    return ''.join(map('{:02X}'.format, bytes))
+
+
+def ok_fail(v1, v2):
+    return 'OK' if v1 == v2 else 'FAIL'
+
+
+def magic_search_offset(mm, magic):
+    """ Search firmware for some Magic id number """
+    magic_offsets = []
+    offset = mm.find(magic, 0)
+    while offset != -1:
+        magic_offsets.append(offset)
+        mm.seek(offset + len(magic))
+        offset = mm.find(magic, offset + len(magic))
+    return magic_offsets
+
+
+def get_crc32(f, offset, length=-1, value=0):
+    """ Read some bytes from a file hanlde and return the CRC32 """
+    f.seek(offset)
+    content = f.read(length)
+    return zlib.crc32(content, value) & 0xffffffff
+
+
+def save_file_part(f, dst_filename, offset, length=-1):
+    """ Read some byte from a file handle and save into a named file """
+    global dst_directory
+    file_path = os.path.join(dst_directory, dst_filename)
+    path = os.path.dirname(file_path)
+    if not os.path.exists(path):
+        os.mkdir(path)
+    f.seek(offset)
+    content = f.read(length)
+    with open(file_path, 'wb') as of:
+        of.write(content)
+
+
+class get_firmware_header:
+    """ Read and parse the firmware file header """
+    def __init__(self, firmware):
+        firmware.seek(0)
+        self.sections_table = []
+        self.name = firmware.read(FIRMWARE_FILE_HEADER_NAME_LEN).decode('utf-8').rstrip('\0')
+        self.unknown1 = int.from_bytes(firmware.read(4), 'little')
+        self.crc32 = int.from_bytes(firmware.read(4), 'little')
+        self.crc32_actual = get_crc32(firmware, FIRMWARE_FILE_HEADER_LEN)
+        # Read the sections table.
+        section_offset = FIRMWARE_FILE_HEADER_LEN
+        sections_running_crc32 = 0
+        for i in range(0, FIRMWARE_FILE_HEADER_SECTIONS_TABLE_MAX_ENTRIES):
+            entry_offset = FIRMWARE_FILE_HEADER_SECTIONS_TABLE_OFFSET + i * 8
+            firmware.seek(entry_offset)
+            section_len = int.from_bytes(mm.read(4), 'little')
+            if section_len == 0:
+                break
+            # The stored CRC32 is a "running CRC32" with bits negated.
+            section_crc32 = 0xffffffff ^ int.from_bytes(mm.read(4), 'little')
+            # Calculate the actual running CRC32 of the sections.
+            sections_running_crc32 = get_crc32(firmware, section_offset, section_len, sections_running_crc32)
+            section_entry = sections_table_entry(section_offset, section_len, section_crc32, sections_running_crc32)
+            self.sections_table.append(section_entry)
+            section_offset += section_len
+
+
+class sections_table_entry:
+    """ Contains one entry of the sections table, contained into the firmware file header """
+    def __init__(self, offset, length, crc32, crc32_actual):
+        self.offset = offset
+        self.length = length
+        self.crc32 = crc32
+        self.crc32_actual = crc32_actual
+
+
+class get_section_header:
+    """ Read the header of a firmware section, given the offset """
+    def __init__(self, firmware, header_offset):
+        firmware.seek(header_offset)
+        self.offset_head   = header_offset
+        self.offset_sect   = header_offset + SECTION_HEADER_LEN
+        self.crc32         = int.from_bytes(firmware.read(4), 'little')
+        if SECTION_VERSION_FORMAT == 'big':
+            self.ver_major = int.from_bytes(firmware.read(2), SECTION_VERSION_FORMAT)
+            self.ver_minor = int.from_bytes(firmware.read(2), SECTION_VERSION_FORMAT)
+        else:
+            self.ver_minor = int.from_bytes(firmware.read(2), SECTION_VERSION_FORMAT)
+            self.ver_major = int.from_bytes(firmware.read(2), SECTION_VERSION_FORMAT)
+        self.day           = int.from_bytes(firmware.read(1), 'little')
+        self.month         = int.from_bytes(firmware.read(1), 'little')
+        self.year          = int.from_bytes(firmware.read(2), 'little')
+        self.length        = int.from_bytes(firmware.read(4), 'little')
+        self.memory        = int.from_bytes(firmware.read(4), 'little')
+        self.flag          = int.from_bytes(firmware.read(4), 'little')
+        self.version       = '%d.%d' % (self.ver_major, self.ver_minor)
+        self.date          = '%04d-%02d-%02d' % (self.year, self.month, self.day)
+        self.crc32_actual  = get_crc32(firmware, self.offset_sect, self.length)
+
+
+class get_romfs_header:
+    """ Read the header of an Ambarella ROMFS partition """
+    def __init__(self, firmware, partition_offset):
+        firmware.seek(partition_offset + len(ROMFS_PARTITION_HEADER_MAGIC))
+        self.offset = None
+        self.file_count = None
+        self.files_directory = []
+        self.offset = partition_offset
+        self.file_count = int.from_bytes(firmware.read(4), 'little')
+        if self.file_count > 0xffff:
+            # Too much files! Magic did not work?
+            self.file_count = -1
+            return
+        offset_expected = ROMFS_PARTITION_HEADER_LEN
+        for i in range(0, self.file_count):
+            file_entry_offset = partition_offset + len(ROMFS_PARTITION_HEADER_MAGIC) + 4 + ROMFS_FILE_ENTRY_LEN * i
+            firmware.seek(file_entry_offset)
+            name            = firmware.read(ROMFS_FILENAME_LEN).decode('utf-8').rstrip('\0')
+            length          = int.from_bytes(firmware.read(4), 'little')
+            offset_rel      = int.from_bytes(firmware.read(4), 'little')  # File offset relative to partition.
+            offset_abs      = partition_offset + offset_rel               # File offset relative to firmware image file.
+            crc32           = int.from_bytes(firmware.read(4), 'little')
+            padding_zeroes  = 2048 - ((offset_rel + length) % 2048)
+            offset_next     = offset_rel + length + padding_zeroes
+            crc32_actual    = get_crc32(firmware, offset_abs, length)
+            item = romfs_file_entry(i, name, length, offset_rel, offset_abs, crc32, padding_zeroes, offset_next, crc32_actual, offset_expected)
+            offset_expected = offset_next
+            self.files_directory.append(item)
+
+
+class romfs_file_entry:
+    """ Contains one entry of the ROMFS directory """
+    def __init__(self, pos, name, length, offset_rel, offset_abs, crc32, padding_zeroes, offset_next, crc32_actual, offset_expected):
+        self.pos = pos
+        self.name = name
+        self.length = length
+        self.offset_rel = offset_rel
+        self.offset_abs = offset_abs
+        self.crc32 = crc32
+        self.padding_zeroes = padding_zeroes
+        self.offset_next = offset_next
+        self.crc32_actual = crc32_actual
+        self.offset_expected = offset_expected
+
+
+def firmware_print_header(h):
+    """ """
+    print('%s: CRC32 on file [0x%04X:EOF]: from header 0x%08X <=> actual 0x%08X' % (ok_fail(h.crc32, h.crc32_actual), FIRMWARE_FILE_HEADER_LEN, h.crc32, h.crc32_actual))
+    print('')
+    tw = 67
+    print('+%s+' % ('-'*tw,))
+    print('|%s|' % 'Ambarella Firmware File Header - Sections Table'.center(tw),)
+    print('+%s+' % ('-'*tw,))
+    print('| %-13s | %-10s | %-15s | %-18s |' % ('Len (+header)', '~CRC32', 'Running CRC32', 'Offset calculated'))
+    print('|%s|' % ('-'*tw,))
+    for i in h.sections_table:
+        print('| %13d | 0x%08X | 0x%08X %4s | 0x%08X %s |' % (i.length, i.crc32, i.crc32_actual, ok_fail(i.crc32, i.crc32_actual), i.offset, ' '*7))
+    print('+%s+' % ('-'*tw,))
+    print('')
+
+
+def section_print_header(headers):
+    """ """
+    tw = 107
+    print('+%s+' % ('-'*tw,))
+    print('|%s|' % ('Ambarella Firmware Sections found by Magic %s' % (hex_repr(SECTION_MAGIC),)).center(tw),)
+    print('+%s+' % ('-'*tw,))
+    print('| %-10s | %-10s | %-8s | %-15s | %-11s | %-10s | %-10s | %-10s |' % ('Header', 'Section', 'Len', 'CRC32', 'Version', 'Date', 'Memory', 'Flag'))
+    print('+%s+' % ('-'*tw,))
+    for h in headers:
+        print('| 0x%08X | 0x%08X | %8d | 0x%08X %-4s | %11s | %010s | 0x%08X | 0x%08X |' % (h.offset_head, h.offset_sect, h.length, h.crc32, ok_fail(h.crc32, h.crc32_actual), h.version, h.date, h.memory, h.flag))
+    print('+%s+' % ('-'*tw,))
+    print('')
+
+
+def romfs_print_header(romfs):
+    """ """
+    tw = 100
+    print('+%s' % ('-'*tw,))
+    print('| Ambarella ROMFS Partition found by Magic %s at 0x%08X, file count: %d' % (hex_repr(ROMFS_PARTITION_HEADER_MAGIC), romfs.offset, romfs.file_count))
+    print('+%s' % ('-'*tw,))
+    print('| %-2s | %-10s | %-10s | %-7s | %-4s | %-10s | %-15s | %s' % ('#', 'Offset', 'Rel. off.', 'Len', 'Pad', 'Next off.', 'CRC32', 'Name'))
+    print('+%s' % ('-'*tw,))
+    for i in romfs.files_directory:
+        print('| %02d | 0x%08X | 0x%08X | %7d | %4d | 0x%08X | 0x%08X %4s | %s' % (i.pos, i.offset_abs, i.offset_rel, i.length, i.padding_zeroes, romfs.offset + i.offset_next, i.crc32, ok_fail(i.crc32, i.crc32_actual), i.name,))
+    print('+%s' % ('-'*tw,))
+    print('')
+    warnings = False
+    for i in romfs.files_directory:
+        if i.offset_rel != i.offset_expected :
+            print('WARNING: File %02d: relative offset declared in header: 0x%08X, calculated: 0x%08X' % (i.pos, i.offset_rel, i.offset_expected))
+            warnings = True
+    if warnings:
+        print('')
+
+
+def romfs_extract_files(firmware, romfs):
+    """ Save files from Ambarella ROMFS partition """
+    subdir = '%08X_files' % (romfs.offset,)
+    for i in romfs.files_directory:
+        dst_file = os.path.join(subdir, i.name)
+        save_file_part(firmware, dst_file, i.offset_abs, i.length)
+        print('INFO: File "%s" saved' % (dst_file,))
+    print('')
+
+
+#-------------------------------------------------------------------------
+# Get filenames from command line.
+#-------------------------------------------------------------------------
+if len(sys.argv) < 4:
+    print('Usage: %s FIRMWARE.bin FIRMWARE_CHECK.ch DST_DIRECTORY' % (os.path.basename(sys.argv[0]),))
+    sys.exit(1)
+firmware_file = sys.argv[1]
+firmware_check = sys.argv[2]
+dst_directory = sys.argv[3]
+if not os.path.exists(firmware_file):
+    print('ERROR: File "%s" does not exists' % (firmware_file,))
+    sys.exit(1)
+if not os.path.exists(firmware_check):
+    print('WARNING: File "%s" does not exists' % (firmware_check,))
+    firmware_check = None
+if os.path.exists(dst_directory):
+    print('ERROR: Directory "%s" alrady exists' % (dst_directory,))
+    sys.exit(1)
+
+#-------------------------------------------------------------------------
+# Main program.
+#-------------------------------------------------------------------------
+fw = open(firmware_file, "r+b")
+mm = mmap.mmap(fw.fileno(), 0)
+
+# Check firmware file against the MD5 checksum file.
+if firmware_check is not None:
+    if check_md5(mm, firmware_check):
+        print('OK: MD5 calculated on file "%s" matches content of "%s"' % (firmware_file, firmware_check))
+    else:
+        print('FAIL: MD5 calculated on file "%s" does not match content of "%s"' % (firmware_file, firmware_check))
+else:
+    print('WARNING: No checksum for file "%s" was specified' % (firmware_file,))
+
+# Parse the header of the firmware file.
+file_header = get_firmware_header(mm)
+firmware_print_header(file_header)
+dst_file = '%08X_header.bin' % (0,)
+save_file_part(mm, dst_file, 0, FIRMWARE_FILE_HEADER_LEN)
+print('INFO: File "%s" saved' % (dst_file,))
+print('')
+
+# Search Ambarella sections using Magic identifier.
+magics = magic_search_offset(mm, SECTION_MAGIC)
+print('Section Magic IDs found at: %s\n' % (' '.join(['0x%08X' % x for x in magics]),))
+sections_magic_offset = [x-24 for x in magics]
+
+# Verify that offsets found by Magic do match the sections table.
+sections_table_offsets = [x.offset for x in file_header.sections_table]
+for offset in sections_magic_offset:
+    if not offset in sections_table_offsets:
+        print('WARNING: Section found by Magic at offset 0x%08X does not match any entry in sections table' % (offset,))
+
+# Get data from sections headers, save files and print info.
+section_headers = []
+# Prefer sections found by Magic, not sections table in header.
+for offset in sections_magic_offset:
+    sect_header = get_section_header(mm, offset)
+    section_headers.append(sect_header)
+    dst_file = '%08X_head.bin' % (sect_header.offset_head,)
+    save_file_part(mm, dst_file, sect_header.offset_head, SECTION_HEADER_LEN)
+    print('INFO: File "%s" saved' % (dst_file,))
+    dst_file = '%08X_sect.bin' % (sect_header.offset_sect,)
+    save_file_part(mm, dst_file, sect_header.offset_sect, sect_header.length)
+    print('INFO: File "%s" saved' % (dst_file,))
+print('')
+section_print_header(section_headers)
+
+# Search Ambarella ROMFS partition using Magic identifier.
+romfs_partitions_offset = magic_search_offset(mm, ROMFS_PARTITION_HEADER_MAGIC)
+print('ROMFS Magic IDs found at: %s' % (' '.join(['0x%08X' % x for x in romfs_partitions_offset]),))
+# Print ROMFS files directories, extract files and save file lists.
+for offset in romfs_partitions_offset:
+    romfs_header = get_romfs_header(mm, offset)
+    # TODO Check filelist!
+    print('File list count: %d' % (len(romfs_header.files_directory),))
+    romfs_print_header(romfs_header)
+    romfs_extract_files(mm, romfs_header)
+    filename = '%08X.dir' % (romfs_header.offset,)
+    with open(os.path.join(dst_directory, filename), 'w') as of:
+        for i in romfs_header.files_directory:
+            of.write(i.name + '\n')
