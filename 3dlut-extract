@@ -1,0 +1,55 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+Extract a 16x16x16 3D-LUT table from an Ambarella ROMFS file.
+"""
+
+from PIL import Image, ImageDraw
+import mmap
+import os
+import sys
+
+__author__ = "Niccolo Rigacci"
+__copyright__ = "Copyright 2021 Niccolo Rigacci <niccolo@rigacci.org>"
+__license__ = "GPLv3-or-later"
+__email__ = "niccolo@rigacci.org"
+__version__ = "0.1.0"
+
+LUT_SIZE = 16
+SQUARE_SIZE = 8
+IMAGE_WIDTH = LUT_SIZE * SQUARE_SIZE
+IMAGE_HEIGHT = IMAGE_WIDTH
+BORDER = SQUARE_SIZE
+
+if len(sys.argv) < 3:
+    print('Usage: %s FILE OFFSET' % (os.path.basename(sys.argv[0]),))
+    sys.exit(1)
+
+firmware_file = sys.argv[1]
+offset = int(sys.argv[2], 16)
+lut_filename = '%s_lut-0x%08X.png' % (firmware_file, offset)
+
+fw = open(firmware_file, "r+b")
+f = mmap.mmap(fw.fileno(), 0)
+f.seek(offset)
+img = Image.new('RGB', (IMAGE_WIDTH * LUT_SIZE + ((LUT_SIZE - 1) * BORDER), IMAGE_HEIGHT), color = 'black')
+for z in range(0, LUT_SIZE):
+    for y in range(0, LUT_SIZE):
+        for x in range(0, LUT_SIZE):
+            int32 = int.from_bytes(f.read(4), 'little')
+            red   = (int32 >>  0) & 0b1111111111
+            green = (int32 >> 10) & 0b1111111111
+            blue  = (int32 >> 20) & 0b1111111111
+            #print('0x%08X' % (int32,))
+            #print('%d, %d, %d' % (red, green, blue))
+            fill_color = 'rgb(%d,%d,%d)' % (red, green, blue)
+            x0 = x * SQUARE_SIZE + z * (SQUARE_SIZE * LUT_SIZE) + z * BORDER
+            y0 = y * SQUARE_SIZE
+            square = ImageDraw.Draw(img)
+            square.rectangle([x0, y0, x0 + SQUARE_SIZE, y0 + SQUARE_SIZE], fill=fill_color)
+img.save(lut_filename)
+
+file_pointer = f.tell()
+f.seek(0, 2)
+file_end = f.tell()
+print('LUT: start: 0x%08X, size: %d, end: 0x%08X - File end: 0x%08X, remaining bytes: %d' % (offset, 4 * (LUT_SIZE ** 3), file_pointer, file_end, file_end - file_pointer))
