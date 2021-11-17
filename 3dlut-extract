@@ -2,6 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Extract a 16x16x16 3D-LUT table from an Ambarella ROMFS file.
+
+The saved image is 3x8-bit pixels, where the original colors
+are 3x10-bit instead.
 """
 
 from PIL import Image, ImageDraw
@@ -16,10 +19,17 @@ __email__ = "niccolo@rigacci.org"
 __version__ = "0.1.0"
 
 LUT_SIZE = 16
-SQUARE_SIZE = 8
-IMAGE_WIDTH = LUT_SIZE * SQUARE_SIZE
+BIT_MASK = 0b1111111111
+PIXEL_SIZE = 8
+IMAGE_WIDTH = LUT_SIZE * PIXEL_SIZE
 IMAGE_HEIGHT = IMAGE_WIDTH
-BORDER = SQUARE_SIZE
+BORDER = PIXEL_SIZE
+
+
+def norm(val):
+    # Normalize a 10-bit number to 8-bit.
+    return int(float(val) / float(BIT_MASK) * 256.0)
+
 
 if len(sys.argv) < 3:
     print('Usage: %s FILE OFFSET' % (os.path.basename(sys.argv[0]),))
@@ -37,16 +47,19 @@ for z in range(0, LUT_SIZE):
     for y in range(0, LUT_SIZE):
         for x in range(0, LUT_SIZE):
             int32 = int.from_bytes(f.read(4), 'little')
-            red   = (int32 >>  0) & 0b1111111111
-            green = (int32 >> 10) & 0b1111111111
-            blue  = (int32 >> 20) & 0b1111111111
-            #print('0x%08X' % (int32,))
-            #print('%d, %d, %d' % (red, green, blue))
-            fill_color = 'rgb(%d,%d,%d)' % (red, green, blue)
-            x0 = x * SQUARE_SIZE + z * (SQUARE_SIZE * LUT_SIZE) + z * BORDER
-            y0 = y * SQUARE_SIZE
+            red   = (int32 >>  0) & BIT_MASK
+            green = (int32 >> 10) & BIT_MASK
+            blue  = (int32 >> 20) & BIT_MASK
+            print('(%4d, %4d, %4d), ' % (red, green, blue), end='')
+            #print('(%3x, %3x, %3x), ' % (red, green, blue))
+            fill_color = 'rgb(%d,%d,%d)' % (norm(red), norm(green), norm(blue))
+            x0 = x * PIXEL_SIZE + z * (PIXEL_SIZE * LUT_SIZE + BORDER)
+            y0 = (LUT_SIZE - y - 1) * PIXEL_SIZE
             square = ImageDraw.Draw(img)
-            square.rectangle([x0, y0, x0 + SQUARE_SIZE, y0 + SQUARE_SIZE], fill=fill_color)
+            square.rectangle([x0, y0, x0 + PIXEL_SIZE, y0 + PIXEL_SIZE], fill=fill_color)
+        print('')
+    print('')
+print('')
 img.save(lut_filename)
 
 file_pointer = f.tell()
