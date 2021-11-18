@@ -3,8 +3,8 @@
 """
 Extract a 16x16x16 3D-LUT table from an Ambarella ROMFS file.
 
-The saved image is 3x8-bit pixels, where the original colors
-are 3x10-bit instead.
+NOTICE: The saved image is a PNG 3x8-bit, where the original
+colors are 3x10-bit instead.
 """
 
 from PIL import Image, ImageDraw
@@ -16,14 +16,12 @@ __author__ = "Niccolo Rigacci"
 __copyright__ = "Copyright 2021 Niccolo Rigacci <niccolo@rigacci.org>"
 __license__ = "GPLv3-or-later"
 __email__ = "niccolo@rigacci.org"
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 LUT_SIZE = 16
 BIT_MASK = 0b1111111111
-PIXEL_SIZE = 8
-IMAGE_WIDTH = LUT_SIZE * PIXEL_SIZE
-IMAGE_HEIGHT = IMAGE_WIDTH
-BORDER = PIXEL_SIZE
+DOT_SIZE = 8
+BORDER = DOT_SIZE
 
 
 def norm(val):
@@ -42,7 +40,10 @@ lut_filename = '%s_lut-0x%08X.png' % (firmware_file, offset)
 fw = open(firmware_file, "r+b")
 f = mmap.mmap(fw.fileno(), 0)
 f.seek(offset)
-img = Image.new('RGB', (IMAGE_WIDTH * LUT_SIZE + ((LUT_SIZE - 1) * BORDER), IMAGE_HEIGHT), color = 'black')
+
+image_width = (LUT_SIZE * DOT_SIZE) * LUT_SIZE + BORDER * (LUT_SIZE + 1)
+image_height = (LUT_SIZE * DOT_SIZE) + BORDER * 2
+img = Image.new('RGB', (image_width, image_height), color = 'white')
 for z in range(0, LUT_SIZE):
     for y in range(0, LUT_SIZE):
         for x in range(0, LUT_SIZE):
@@ -53,10 +54,10 @@ for z in range(0, LUT_SIZE):
             print('(%4d, %4d, %4d), ' % (red, green, blue), end='')
             #print('(%3x, %3x, %3x), ' % (red, green, blue))
             fill_color = 'rgb(%d,%d,%d)' % (norm(red), norm(green), norm(blue))
-            x0 = x * PIXEL_SIZE + z * (PIXEL_SIZE * LUT_SIZE + BORDER)
-            y0 = (LUT_SIZE - y - 1) * PIXEL_SIZE
+            x0 = BORDER + x * DOT_SIZE + z * (DOT_SIZE * LUT_SIZE + BORDER)
+            y0 = BORDER + (LUT_SIZE - y - 1) * DOT_SIZE
             square = ImageDraw.Draw(img)
-            square.rectangle([x0, y0, x0 + PIXEL_SIZE, y0 + PIXEL_SIZE], fill=fill_color)
+            square.rectangle([x0, y0, x0 + DOT_SIZE, y0 + DOT_SIZE], fill=fill_color)
         print('')
     print('')
 print('')
