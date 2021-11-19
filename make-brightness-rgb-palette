@@ -1,0 +1,90 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+Generate an image with the full RGB palette and varying brightness.
+"""
+
+import colorsys
+import sys
+from PIL import Image, ImageDraw
+
+IMAGE_WIDTH = 1920
+IMAGE_HEIGHT = 1080
+DOT_SIZE = 8
+
+__author__ = "Niccolo Rigacci"
+__copyright__ = "Copyright 2021 Niccolo Rigacci <niccolo@rigacci.org>"
+__license__ = "GPLv3-or-later"
+__email__ = "niccolo@rigacci.org"
+__version__ = "0.1.2"
+
+# Index of colors in RGB coordinates.
+RED = 0
+GREEN = 1
+BLUE = 2
+# Max value for a color component: 255 for 8-bit colors.
+MAX_VAL = 255.0
+
+# Edges of the color cube to follow when creating the color gradient.
+# Blue -> Violet -> Red -> Yellow -> Green -> Cyan -> Blue
+EDGES = [[BLUE, RED], [RED, GREEN], [GREEN, BLUE]]
+
+# Shift the palette to le left.
+# A value of 1.0 means to shift to the next primary color.
+PALETTE_SHIFT = -0.5
+
+
+def color_adjust(c, luminance):
+    """ Set the brightness of an RGB color, using HLS model """
+    h, l, s = colorsys.rgb_to_hls(c[0] / MAX_VAL, c[1] / MAX_VAL, c[2] / MAX_VAL)
+    r, g, b = colorsys.hls_to_rgb(h, luminance, s)
+    return (int(r * MAX_VAL), int(g * MAX_VAL), int(b * MAX_VAL))
+
+
+def make_gradient(brightness):
+    """ Create a color gradient along the colors in EDGES """
+    ramp = []
+    # The ramp gradates with two sub-gradients for each pair of primary colors.
+    step_count = int(IMAGE_WIDTH / DOT_SIZE / 2.0 / 3.0)
+    # Increment of the color component.
+    step = float(MAX_VAL) / step_count
+    current_color = [0, 0, 0]
+    for edge in EDGES:
+        # Make the sub-gradients from one primary color to another:
+        #  * Begin with pure primary color #1.
+        #  * Step increasing the component of primary color #2.
+        #  * Step decreasing the component of primary color #1.
+        component_0 = edge[0]
+        component_1 = edge[1]
+        current_color[component_0] = int(MAX_VAL)
+        for i in range(0, step_count):
+            val = step * i
+            current_color[component_1] = int(val)
+            #print(current_color)
+            ramp.append(color_adjust(current_color, brightness))
+        current_color[component_1] = int(MAX_VAL)
+        for i in range(0, step_count):
+            val = MAX_VAL - step * i
+            current_color[component_0] = int(val)
+            #print(current_color)
+            ramp.append(color_adjust(current_color, brightness))
+        current_color[component_0] = 0
+        #print('----')
+    shift_index = int(PALETTE_SHIFT * step_count * 2.0)
+    ramp = ramp[shift_index:] + ramp[:shift_index]
+    return ramp
+
+img = Image.new('RGB', (IMAGE_WIDTH, IMAGE_HEIGHT), color = 'black')
+steps_y = int(IMAGE_HEIGHT / DOT_SIZE)
+for y in range(0, steps_y):
+    brightness = (steps_y - y) / steps_y
+    ramp = make_gradient(brightness)
+    x = 0
+    for c in ramp:
+        fill_color = 'rgb(%d,%d,%d)' % (c[RED], c[GREEN], c[BLUE])
+        x0 = x * DOT_SIZE
+        y0 = y * DOT_SIZE
+        square = ImageDraw.Draw(img)
+        square.rectangle([x0, y0, x0 + DOT_SIZE, y0 + DOT_SIZE], fill=fill_color)
+        x += 1
+img.save('brightness-rgb-palette.png')
