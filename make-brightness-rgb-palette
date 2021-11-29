@@ -11,12 +11,13 @@ from PIL import Image, ImageDraw
 IMAGE_WIDTH = 1920
 IMAGE_HEIGHT = 1080
 DOT_SIZE = 8
+DST_FILE='brightness-rgb-palette.png'
 
 __author__ = "Niccolo Rigacci"
 __copyright__ = "Copyright 2021 Niccolo Rigacci <niccolo@rigacci.org>"
 __license__ = "GPLv3-or-later"
 __email__ = "niccolo@rigacci.org"
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # Index of colors in RGB coordinates.
 RED = 0
@@ -87,4 +88,5 @@ for y in range(0, steps_y):
         square = ImageDraw.Draw(img)
         square.rectangle([x0, y0, x0 + DOT_SIZE, y0 + DOT_SIZE], fill=fill_color)
         x += 1
-img.save('brightness-rgb-palette.png')
+img.save(DST_FILE)
+print('Created file "%s"' % (DST_FILE,))
